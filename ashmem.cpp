@@ -57,7 +57,9 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/sem.h>
 #include <semaphore.h>
+#include <sys/ipc.h>
 #include <unistd.h>
 
 #include<android/sharedmem.h>
@@ -67,8 +69,8 @@
 #define SHM_STORE_FILE_ENV "ENVAR_SHM_STORE_FD"
 #define SHM_STORE_NAME "ashmem_store"
 
-#define FOUND_REGISTRY_PID_FD 1 << 0
-#define FOUND_REGISTRY_FD     1 << 1
+#define FOUND_PID 1 << 0
+#define FOUND_FD  1 << 1
 
 typedef struct {
 	int empty;
@@ -79,10 +81,17 @@ typedef struct {
 	char name[ASHMEM_NAME_MAX_LENGTH+1];
 } memfd_t;
 
-typedef  memfd_t* memfdptr_t;
+typedef union {
+	/* Used in calls to semctl() */
+	int    val;
+	struct semid_ds *buf;
+	unsigned short      *array;
+	#if defined(__linux__)
+		struct seminfo      *__buf;
+	#endif
+} senum_t;
 
-static sem_t* sem_memfd = sem_open("/memfd_store_mutex", O_CREAT|O_RDWR, 
-				S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH, 1);
+typedef  memfd_t* memfdptr_t;
 
 static memfd_t* memfd_store = nullptr;	
 	
@@ -95,7 +104,6 @@ __attribute__((visibility("hidden")))  static int pidfd_getfd(int pidfd, int tar
 {
 	return syscall(SYS_pidfd_getfd, pidfd, targetfd, flags);
 }
-
 
 __attribute__((visibility("hidden")))  static int shm_store_initialize(int memfd){
 	memfd_store = (memfd_t*) syscall(SYS_mmap, NULL, ASharedMemory_getSize(memfd), 
@@ -120,70 +128,96 @@ __attribute__((visibility("hidden")))  static int shm_store_initialize(int memfd
 	}
 	return 0;
 }
-	   
-__attribute__((visibility("hidden")))  static int shm_store_create(){
-	int memfd = -1;
-	if(sem_wait(sem_memfd)==0){
-		int memfd = ASharedMemory_create(SHM_STORE_NAME, sizeof(memfd_t)*MAX_SHM_FILES);
-		if(memfd >=0){
-			pid_t pid = getpid();
-			int sz = snprintf(NULL, 0, "/proc/%i/fd/%i", pid, memfd);
-			char* proc_pid_fd_name =(char*) malloc(sizeof(char)*(sz+1));
-			snprintf(proc_pid_fd_name, sz+1, "/proc/%i/fd/%i",  pid, memfd);
-			if(setenv(SHM_STORE_FILE_ENV, proc_pid_fd_name, 1) == -1){
-				#if defined(DEBUG)
-					perror("shm_store_create.setenv");
-				#endif
-			}
-			free(proc_pid_fd_name);
-		}
-		if(sem_post(sem_memfd)==-1){
-			#if defined(DEBUG)
-				perror("shm_store_create.sem_post");
-			#endif
-		}
-	}
-	return memfd;
-}
 
-__attribute__((visibility("hidden")))  static int shm_store_parse(){
-	pid_t pid;
-	int regfd = 0;
-	int flags = 0;
-	if(sem_wait(sem_memfd) == 0){
-		#if defined(DEBUG)
-			perror("shm_store_create.sem_wait");
-		#endif
-
-
-		char* rest = getenv(SHM_STORE_FILE_ENV);
+__attribute__((visibility("hidden")))  static inline int parse_procfs_path(char *path, int* pid, int* handle)
+{
 		char* saveptr;
-		char* token = strtok_r(rest, "/", &saveptr);
+		char* token = strtok_r(path, "/", &saveptr);
+		int flags = 0;
 		for (int i = 0; token!= NULL; i++ )
 		{
 			if( i == 2)
 			{
-				pid = atoi(token);
-				if(pid > 0) // 0 would be system process or error
+				*pid = atoi(token);
+				if(*pid > 0) // 0 would be system process or error
 				{
-					flags |= FOUND_REGISTRY_PID_FD;
+					flags |= FOUND_PID;
 				}
 			}else if(i == 4){
-				regfd = atoi(token);
-				if(regfd > 0) // 0 would be stdin or error
+				*handle = atoi(token);
+				if(*handle > 0) // 0 would be stdin or error
 				{
-					flags |= FOUND_REGISTRY_FD;
+					flags |= FOUND_FD;
 				}
 			}
 			token = strtok_r(NULL, "/", &saveptr); 
 		}
-		if(sem_post(sem_memfd)==-1){
+		return flags;
+}
+
+__attribute__((visibility("hidden")))  static int get_semid(pid_t pid)
+{
+	int sz = snprintf(NULL, 0, "/proc/%i/exe", pid);
+	char* proc_pid_exe =(char*) malloc(sizeof(char)*(sz+1));
+	snprintf(proc_pid_exe, sz+1, "/proc/%i/exe", pid);
+	key_t key = ftok(proc_pid_exe, (int) '0');
+	free(proc_pid_exe);
+	return semget(key,0,0);
+}
+
+__attribute__((visibility("hidden")))  static int shm_store_create(){
+	int memfd = -1;
+	pid_t pid = getpid();
+	int sz = snprintf(NULL, 0, "/proc/%i/exe", pid);
+	char* proc_pid_exe =(char*) malloc(sizeof(char)*(sz+1));
+	snprintf(proc_pid_exe, sz+1, "/proc/%i/exe", pid);
+	key_t key = ftok(proc_pid_exe, (int) '0');
+	free(proc_pid_exe);
+	int semid ;
+	if ((semid = semget(key, 1, IPC_CREAT | S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH)) != -1) {
+		senum_t arg;
+
+		/* Initialize the semaphore. */
+		arg.val = 0;
+		if (semctl(semid, 0, SETVAL, arg) == -1) {
 			#if defined(DEBUG)
-				perror("shm_store_create.sem_post");
+				perror("IPC error: semop");
+			#endif
+			return -1;
+		}
+	} else  {
+		#if defined(DEBUG)
+			perror("IPC error: semget");
+		#endif
+		return -1;
+	}
+
+	if((memfd = ASharedMemory_create(SHM_STORE_NAME, sizeof(memfd_t)*MAX_SHM_FILES)) >=0){
+		int sz = snprintf(NULL, 0, "/proc/%i/fd/%i", pid, memfd);
+		char* proc_pid_fd_name =(char*) malloc(sizeof(char)*(sz+1));
+		snprintf(proc_pid_fd_name, sz+1, "/proc/%i/fd/%i", pid, memfd);
+		if(setenv(SHM_STORE_FILE_ENV, proc_pid_fd_name, 1) == -1){
+			#if defined(DEBUG)
+				perror("shm_store_create.setenv");
 			#endif
 		}
+		free(proc_pid_fd_name);
+	} else  {
+		#if defined(DEBUG)
+			perror("ASharedMemory_create");
+		#endif
+		return -1;
 	}
-	if((flags & (FOUND_REGISTRY_PID_FD|FOUND_REGISTRY_FD)) == (FOUND_REGISTRY_PID_FD|FOUND_REGISTRY_FD)){
+	return memfd;
+}
+
+
+__attribute__((visibility("hidden")))  static int shm_store_parse(){
+	pid_t pid;
+	int regfd = 0;
+	int flags = parse_procfs_path(getenv(SHM_STORE_FILE_ENV), &pid, &regfd);
+
+	if((flags & (FOUND_PID|FOUND_FD)) == (FOUND_PID|FOUND_FD)){
 		int pidfd = pidfd_open(pid, PIDFD_NONBLOCK);
 		if(pidfd == -1)
 		{
@@ -223,7 +257,6 @@ int shm_init(){
 	}
 	return memfd;
 }
-
 
 __attribute__((visibility("hidden"))) static bool has_memfd_named(const char* name, memfd_t* entry = nullptr)
 {
@@ -292,8 +325,8 @@ void* __wrap_mmap(void *addr, size_t length, int prot, int flags,
     return (void*) syscall(SYS_mmap, addr, length, prot, flags, fd, offset); // if offset !=0 on first call, fail
 }
 
-// void* mmap(void *addr, size_t length, int prot, int flags,
-//                   int fd, off_t offset) __attribute__((alias("__wrap_mmap")));
+void* mmap(void *addr, size_t length, int prot, int flags,
+                   int fd, off_t offset) __attribute__((alias("__wrap_mmap")));
 
 __attribute__((visibility("hidden"))) static int shm_memfd_create(const char *name, int oflag){
 	int fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -335,22 +368,20 @@ __attribute__((visibility("hidden"))) static int shm_memfd_store_insert(const ch
 
 // Create or open a shared memory object
 int shm_open(const char *name, int oflag, mode_t mode) {
-	// This code needs to build on old API levels, so we can't use the libc
-    // wrapper.
+	// TODO:  Add semaphore support
 	
 	memfd_t entry;
 	if(!has_memfd_named(name, &entry))
 	{
-		if(sem_wait(sem_memfd)==0){
-			int memfd = shm_memfd_create(name,oflag);
-			if(memfd>=0){
-				pid_t pid = getpid();
-				entry.index = shm_memfd_store_insert(name, pid, memfd);
-			}
-			sem_post(sem_memfd);
-			entry.memfd = memfd;
+
+		int memfd = shm_memfd_create(name,oflag);
+		if(memfd>=0){
+			pid_t pid = getpid();
+			entry.index = shm_memfd_store_insert(name, pid, memfd);
 		}
-	} 
+		entry.memfd = memfd;
+	}
+
 	if(entry.memfd >=0 && entry.index != -1)
 	{
 		memfd_store[entry.index].count++;
