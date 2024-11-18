@@ -57,7 +57,9 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#ifndef __ANDROID__
 #include <sys/sem.h>
+#endif
 #include <semaphore.h>
 #include <sys/ipc.h>
 #include <unistd.h>
