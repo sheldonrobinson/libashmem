@@ -41,13 +41,20 @@
 #define _GNU_SOURCE 1
 #endif
 
+#if __ANDROID_API__ < 31
+#error Supported only for Android API >= 31
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/ashmem.h>
 #include <linux/memfd.h>
+#if __ANDROID_API__ < 31
 #include <linux/pidfd.h>
+#else
+#include <sys/pidfd.h>
+#endif
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
@@ -57,9 +64,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
-#ifndef __ANDROID__
 #include <sys/sem.h>
-#endif
 #include <semaphore.h>
 #include <sys/ipc.h>
 #include <unistd.h>
@@ -97,6 +102,7 @@ typedef  memfd_t* memfdptr_t;
 
 static memfd_t* memfd_store = nullptr;	
 	
+#if __ANDROID_API__ < 31
 __attribute__((visibility("hidden")))  static int pidfd_open(pid_t pid, unsigned int flags)
 {
 	return syscall(SYS_pidfd_open, pid, flags);
@@ -107,6 +113,15 @@ __attribute__((visibility("hidden")))  static int pidfd_getfd(int pidfd, int tar
 	return syscall(SYS_pidfd_getfd, pidfd, targetfd, flags);
 }
 
+__attribute__((visibility("hidden")))  static int semget(key_t key, int nsems, int flags)
+{
+	return syscall(SYS_semget, key, nsems, flags);
+}
+#else
+#if !defined(PIDFD_NONBLOCK)
+#define PIDFD_NONBLOCK 00004000
+#endif
+#endif
 __attribute__((visibility("hidden")))  static int shm_store_initialize(int memfd){
 	memfd_store = (memfd_t*) syscall(SYS_mmap, NULL, ASharedMemory_getSize(memfd), 
 					PROT_READ|PROT_WRITE, MAP_SHARED, memfd, 0);
