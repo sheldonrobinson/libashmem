@@ -49,6 +49,7 @@ endif()
 install(FILES ${PROJECT_SOURCE_DIR}/include/ashm.h DESTINATION include)
 install(
       TARGETS ashmem
+	  EXPORT ashmem-targets
       RUNTIME
         DESTINATION bin
       LIBRARY
@@ -58,3 +59,5 @@ install(
       INCLUDES
         DESTINATION include
     )
+	
+install(EXPORT ashmem-targets FILE ashmem.cmake DESTINATION lib/cmake/ashmem)
